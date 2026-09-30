@@ -39,8 +39,15 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   in explicitly from the cgroup quota, because Moro's `auto` counts every host core even under
   `--cpuset-cpus`.
 - `json-comp` is the framework's `compression()` middleware attached to the `/json` route alone,
-  so no other endpoint pays for the encoder. It negotiates `br` or `gzip` off `Accept-Encoding`
-  per request and leaves the body alone when the header is absent.
+  so no other endpoint pays for the encoder. It negotiates off `Accept-Encoding` per request and
+  leaves the body alone when the header is absent. gzip is preferred over brotli through the
+  middleware's `encodings` option: at the default level it costs about half the CPU of brotli at
+  the default quality for a body a tenth larger, and the profile scores bytes squared against
+  rate; brotli remains available to a client that accepts nothing else.
+- `UV_THREADPOOL_SIZE=64` is set in the Dockerfile. The libuv pool serves the compression and
+  file reads of every worker thread in the process; Moro sets 64 itself but only at `listen()`,
+  after its startup has initialised the pool at Node's default of 4, and Node reads the variable
+  only at process start.
 - `json-tls`, `static-tls` and `8gbit` listen on `8081` behind the engine's own TLS listener
   (TLS 1.3, ALPN `http/1.1`), when `/certs/server.crt` and `/certs/server.key` are mounted. Moro
   locks one configuration per process, so that listener is a second process running the same file
