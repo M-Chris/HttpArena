@@ -2478,6 +2478,7 @@ fi
 # same port, so endpoint correctness is still covered. If h3 itself is
 # broken, h2load-h3 will catch it at benchmark time with 0 rps.
 _validate_gateway() {
+    _stop_standalone_for_compose
     local profile="$1"
     local compose_file="$2"
     local gateway_docs="$3"
@@ -2637,6 +2638,23 @@ print(f'{count} {has_rating} {has_tags} {has_active_bool}')
     fi
 }
 
+# The standalone container stays up through the compose sections, on the host
+# network (it was started that way for the Postgres sidecar), and nothing below
+# talks to it again (dump_logs reads a stopped container fine). Left running it
+# keeps :8080 bound, so with SO_REUSEPORT the kernel splits the proxy's upstream
+# traffic between it and the stack's own server, and an entry that also
+# subscribes to the H2 family keeps :8443 bound, so the stack's edge cannot bind
+# at all and every gateway check is quietly answered by the entry's own listener
+# (an entry whose H2 listener has the same routes and database passes anyway;
+# production-stack is where it shows, the entry answering 500 where the edge
+# would have said 401). Stop it before the first stack comes up.
+_stop_standalone_for_compose() {
+    if [ "$GATEWAY_ONLY" = "false" ] && [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
+        echo "[compose] stopping the standalone container: the stacks bind the same host ports"
+        docker stop -t 5 "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+}
+
 # ───── Gateway H2 (h2 at the edge) ─────
 
 if has_test "gateway-64"; then
@@ -2690,6 +2708,7 @@ _prodstack_restore_redis() {
 }
 
 _validate_production_stack() {
+    _stop_standalone_for_compose
     local compose_file="$1"
     local docs_url="$2"
     local profile="production-stack"
