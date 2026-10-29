@@ -11,6 +11,7 @@ import { availableParallelism } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread } from 'node:worker_threads';
+import { constants as zlibConstants } from 'node:zlib';
 import { createApp, middleware, MemoryCacheAdapter, RedisCacheAdapter } from '@morojs/moro';
 import ejs from 'ejs';
 import pg from 'pg';
@@ -18,7 +19,10 @@ import pg from 'pg';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FORTUNES_VIEW = join(HERE, 'views', 'fortunes.ejs');
 const DATASET_PATH = process.env.DATASET_PATH || '/data/dataset.json';
-const STATIC_ROOT = '/data/static';
+const STATIC_ROOT = process.env.STATIC_ROOT || '/data/static';
+// The harness mounts the pair at /certs; the override is for running the
+// entry outside the container.
+const CERTS_DIR = process.env.CERTS_DIR || '/certs';
 
 // One process per listener, because Moro locks one configuration per
 // process. 'plain' serves :8080; 'tls' serves json-tls, static-tls and 8gbit
@@ -33,9 +37,9 @@ const STATIC_ROOT = '/data/static';
 const ROLE = process.env.MORO_ROLE || 'plain';
 const LISTENERS = {
     plain: { port: 8080 },
-    tls: { port: 8081, certs: '/certs' },
+    tls: { port: 8081, certs: CERTS_DIR },
     tlscheck: { port: 9000, certs: '/certs-tls', watch: true },
-    h2: { port: 8443, certs: '/certs', http2: true },
+    h2: { port: 8443, certs: CERTS_DIR, http2: true },
     h2c: { port: 8082, http2: true },
 };
 const pairIn = dir => ({ keyFile: join(dir, 'server.key'), certFile: join(dir, 'server.crt') });
@@ -55,7 +59,8 @@ function cpuCount() {
     } catch {}
     return availableParallelism();
 }
-const workers = cpuCount();
+// WORKERS overrides the count, for running the entry outside the container.
+const workers = parseInt(process.env.WORKERS, 10) || cpuCount();
 
 // A worker thread on the native engine, a node:cluster process on the
 // fallback transport. The primary serves nothing, so it loads no dataset and
@@ -179,11 +184,14 @@ function defineRoutes(app) {
     app.post('/baseline11').handler(baseline11);
 
     // Behind the gateway proxies, which terminate TLS and h2 and forward this
-    // over loopback h1, and directly on the HTTP/2 listeners. The type is set
-    // by hand so a bare number is text/plain on every listener, whatever a
-    // server's content sniff would make of it.
+    // over loopback h1, and directly on the HTTP/2 listeners. On the native
+    // engine a bare number sent as a string is text/plain through the
+    // framework's prepared reply; on the HTTP/2 server the type is set by
+    // hand so it is text/plain there too, whatever a content sniff would make
+    // of it.
+    const textPlain = listener.http2 === true;
     app.get('/baseline2').handler((req, res) => {
-        res.setHeader('Content-Type', 'text/plain');
+        if (textPlain) res.setHeader('Content-Type', 'text/plain');
         res.send(String(sumQuery(req.query)));
     });
 
@@ -203,27 +211,38 @@ function defineRoutes(app) {
     // json-comp: the framework's compression middleware on this route alone,
     // so no other endpoint pays for the encoder. It negotiates off
     // Accept-Encoding per request and sends the body as is when none is sent.
-    // gzip is preferred over brotli: at the middleware's default level it
-    // costs about half the CPU of brotli at the default quality for a body one
-    // tenth larger, and the profile prices bytes squared against rate. brotli
-    // stays available for a client that accepts nothing else. The TLS listener
-    // (json-tls) is never asked for an encoding, so its route carries no
-    // middleware and stays on the router's fast path.
+    // gzip at level 3 is preferred over brotli: the profile prices bytes
+    // squared against rate, and on these bodies level 3 costs a little over
+    // a third of the CPU of the default level 6 for 9% more bytes, and about
+    // half the CPU of brotli at quality 3 for 10% more - the rate wins. The
+    // middleware keeps one gzip encoder per worker and resets it between
+    // bodies, so no response pays for building one. brotli, at the quality
+    // fulmine and spliffy use, stays available for a client that accepts
+    // nothing else. The TLS listener (json-tls) is never asked for an
+    // encoding, so its route carries no middleware and stays on the router's
+    // fast path.
     const json = (req, res) => {
         res.json(jsonItems(req));
     };
     if (ROLE === 'plain') {
         app.get('/json/:count')
-            .before(middleware.compression({ encodings: ['gzip', 'br'] }))
+            .before(
+                middleware.compression({
+                    encodings: ['gzip', 'br'],
+                    gzip: { level: 3 },
+                    brotli: { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 3 } },
+                })
+            )
             .handler(json);
     } else {
         app.get('/json/:count').handler(json);
     }
 
     // 8gbit: the body exactly as it arrived, Content-Length or chunked, sent
-    // back as the same bytes. req.rawBody is the framework's undecoded copy.
+    // back as the same bytes. req.rawBody is the framework's undecoded copy,
+    // and a Buffer sent as is goes out application/octet-stream through the
+    // framework's prepared reply.
     app.post('/echo').handler((req, res) => {
-        res.setHeader('Content-Type', 'application/octet-stream');
         res.send(req.rawBody ?? Buffer.alloc(0));
     });
 
@@ -431,11 +450,23 @@ if (ROLE === 'plain') {
 }
 
 if (ROLE === 'tls' || ROLE === 'h2') {
-    // Static files through the framework's own handler, which stats and
-    // reads the file on every request and serves the .br or .gz sidecar on
-    // disk when the client accepts it. Behind a path check so the JSON route
-    // on this port does not pay for the file lookup.
-    const serveStatic = middleware.staticFiles({ root: STATIC_ROOT, prefix: '/static', precompressed: true });
+    // Static files through the framework's own handler with its in-memory
+    // cache: a file and its .br and .gz sidecars are read once and served
+    // from memory with their validators, the sidecar negotiated per request
+    // off Accept-Encoding. The disk is looked at again once a second at
+    // most, or as soon as the directory reports a change, so a replaced file
+    // is served promptly; the uncached handler stats, resolves and reads the
+    // file and its sidecars on every request, and every one of those is a
+    // threadpool round trip shared by all the worker threads of the process.
+    // Behind a path check so the JSON route on this port does not pay for the
+    // lookup; the check calls next() synchronously, so the route stays on
+    // the server's synchronous dispatch.
+    const serveStatic = middleware.staticFiles({
+        root: STATIC_ROOT,
+        prefix: '/static',
+        precompressed: true,
+        cache: true,
+    });
     await app.use((req, res, next) =>
         req.path.startsWith('/static/') ? serveStatic(req, res, next) : next()
     );

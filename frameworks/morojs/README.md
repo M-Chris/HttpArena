@@ -6,7 +6,7 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
 
 - **Language:** JavaScript
 - **Runtime:** Node.js 26
-- **Framework:** [MoroJS 1.8](https://github.com/Moro-JS/moro) on `@morojs/engine`, its own native HTTP engine
+- **Framework:** [MoroJS 1.8](https://github.com/Moro-JS/moro) on `@morojs/engine` 1.1.14, its own native HTTP engine
 - **Build:** Multi-stage on `node:26-trixie-slim`; the engine ships prebuilt binaries, so no toolchain
 
 ## Endpoints
@@ -40,10 +40,13 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   `--cpuset-cpus`.
 - `json-comp` is the framework's `compression()` middleware attached to the `/json` route alone,
   so no other endpoint pays for the encoder. It negotiates off `Accept-Encoding` per request and
-  leaves the body alone when the header is absent. gzip is preferred over brotli through the
-  middleware's `encodings` option: at the default level it costs about half the CPU of brotli at
-  the default quality for a body a tenth larger, and the profile scores bytes squared against
-  rate; brotli remains available to a client that accepts nothing else.
+  leaves the body alone when the header is absent. gzip at level 3 is preferred over brotli
+  through the middleware's `encodings` and `gzip` options: the profile scores bytes squared
+  against rate, and on these bodies level 3 costs a little over a third of the CPU of the default
+  level 6 for 9% more bytes, and about half the CPU of brotli at quality 3 for 10% more. The
+  middleware keeps one gzip encoder per worker and resets it between bodies (`reuseEncoders`, the
+  default), so no response pays for building one. brotli at quality 3, the setting the other JS
+  entries use, remains available to a client that accepts nothing else.
 - `UV_THREADPOOL_SIZE=64` is set in the Dockerfile. The libuv pool serves the compression and
   file reads of every worker thread in the process; Moro sets 64 itself but only at `listen()`,
   after its startup has initialised the pool at Node's default of 4, and Node reads the variable
@@ -64,13 +67,22 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   process for the same one-configuration-per-process reason, clustered as node:cluster processes,
   which is Moro's transport for its Node servers.
 - `/echo` sends back `req.rawBody`, the framework's undecoded copy of the request body, so the
-  bytes are the bytes that arrived, `Content-Length` or chunked alike.
+  bytes are the bytes that arrived, `Content-Length` or chunked alike; a Buffer handed to
+  `res.send()` goes out `application/octet-stream` through the framework's prepared reply.
 - `/ws` is the engine's own RFC 6455 support through `app.websocket()` with `{ raw: true }`, so a
   text frame reaches the handler as the string it carried and `socket.send()` returns it as one.
-- Static files go through `staticFiles({ root: '/data/static', precompressed: true })`, which
-  stats and reads the file on every request, so a replaced file is served on the next response,
-  and serves the `.br` or `.gz` sidecar on disk when the client accepts it. It is mounted on the
-  TLS listener behind a path check so the JSON route on that port does not pay for the lookup.
+  The engine corks the connection for the duration of each read (`@morojs/engine` 1.1.14), so
+  the echoes of a pipelined batch of frames leave in one write.
+- Static files go through `staticFiles({ root: '/data/static', precompressed: true, cache: true })`:
+  the framework's handler with its in-memory cache. A file and its `.br` and `.gz` sidecars are
+  read once and served from memory with their `ETag` and `Last-Modified`, the sidecar negotiated
+  per request from `Accept-Encoding`. The disk is stat'ed again at most once a second, and as soon
+  as the directory reports a change, so a replaced file (same length or not) is served promptly.
+  Without the cache the handler resolves, stats and reads the file and its sidecars on every
+  request, each a libuv threadpool round trip shared by every worker thread of the process. It is
+  mounted on the TLS listener behind a path check so the JSON route on that port does not pay for
+  the lookup; the check calls `next()` synchronously, which keeps that route on the server's
+  synchronous dispatch.
 - `fortunes` goes through EJS directly: Moro ships no view layer, so the template is rendered by
   the engine's own `renderFile`, a separate file with `<%= %>` escaping every cell.
 - The gateway and production-stack edges are stock nginx and Caddy, configured as the fulmine
