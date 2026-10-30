@@ -6,7 +6,7 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
 
 - **Language:** JavaScript
 - **Runtime:** Node.js 26
-- **Framework:** [MoroJS 1.8](https://github.com/Moro-JS/moro) on `@morojs/engine` 1.1.14, its own native HTTP engine
+- **Framework:** [MoroJS 1.8](https://github.com/Moro-JS/moro) on `@morojs/engine` 1.1.15, its own native HTTP engine
 - **Build:** Multi-stage on `node:26-trixie-slim`; the engine ships prebuilt binaries, so no toolchain
 
 ## Endpoints
@@ -78,7 +78,10 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
 - `/ws` is the engine's own RFC 6455 support through `app.websocket()` with `{ raw: true }`, so a
   text frame reaches the handler as the string it carried and `socket.send()` returns it as one.
   The engine corks the connection for the duration of each read (`@morojs/engine` 1.1.14), so
-  the echoes of a pipelined batch of frames leave in one write.
+  the echoes of a pipelined batch of frames leave in one write, each frame built straight into
+  that write (1.1.15). The upgrade itself is the engine's as well (1.1.15, MoroJS 1.8.17): a valid
+  handshake is answered and the socket opened without the request ever entering JavaScript, and
+  the handshake's headers, query and peer address stay readable on the socket on demand.
 - Static files go through `staticFiles({ root: '/data/static', precompressed: true, cache: true })`:
   the framework's handler with its in-memory cache. A file and its `.br` and `.gz` sidecars are
   read once and served from memory with their `ETag` and `Last-Modified`, the sidecar negotiated
