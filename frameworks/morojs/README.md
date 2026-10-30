@@ -16,8 +16,8 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
 | `/pipeline` | GET | Returns `ok` (plain text) |
 | `/baseline11` | GET/POST | Sums query parameter values, plus the body for POST |
 | `/baseline2` | GET | Sums query parameter values (behind the gateway proxies) |
-| `/delay/:ms` | GET | Waits `ms` milliseconds on an awaited timer, then returns `ms` |
-| `/json/:count` | GET | Serializes a slice of the dataset, brotli or gzip when the client asks for it |
+| `/delay/:ms` | GET | Answers `ms` from a timer callback `ms` milliseconds later |
+| `/json/:count` | GET | Serializes a slice of the dataset, brotli (quality 3) or gzip (level 3) when the client asks for it |
 | `/echo` | POST | Returns the request body back verbatim (TLS listener) |
 | `/ws` | WebSocket | Echoes every text and binary frame unchanged |
 | `/async-db` | GET | Reads from PostgreSQL through `pg`, prepared statement, pool sized under `DATABASE_MAX_CONN` |
@@ -40,13 +40,13 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   `--cpuset-cpus`.
 - `json-comp` is the framework's `compression()` middleware attached to the `/json` route alone,
   so no other endpoint pays for the encoder. It negotiates off `Accept-Encoding` per request and
-  leaves the body alone when the header is absent. gzip at level 3 is preferred over brotli
-  through the middleware's `encodings` and `gzip` options: the profile scores bytes squared
-  against rate, and on these bodies level 3 costs a little over a third of the CPU of the default
-  level 6 for 9% more bytes, and about half the CPU of brotli at quality 3 for 10% more. The
-  middleware keeps one gzip encoder per worker and resets it between bodies (`reuseEncoders`, the
-  default), so no response pays for building one. brotli at quality 3, the setting the other JS
-  entries use, remains available to a client that accepts nothing else.
+  leaves the body alone when the header is absent. brotli at quality 3 is preferred, through the
+  middleware's `encodings` and `brotli` options, with the encoder's window fitted to the body by
+  the framework: the profile scores bytes squared against rate, and measured on the board gzip at
+  level 3 ran 7% more requests than brotli 3 but sent 10% more bytes per reply, a 9% lower score.
+  gzip at level 3 remains available to a client that accepts nothing else; the middleware keeps one
+  gzip encoder per worker and resets it between bodies (`reuseEncoders`, the default), while the
+  brotli encoder is built per body, since it forgets its quality on reset.
 - `UV_THREADPOOL_SIZE=64` is set in the Dockerfile. The libuv pool serves the compression and
   file reads of every worker thread in the process; Moro sets 64 itself but only at `listen()`,
   after its startup has initialised the pool at Node's default of 4, and Node reads the variable

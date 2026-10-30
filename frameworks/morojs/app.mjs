@@ -195,32 +195,40 @@ function defineRoutes(app) {
         res.send(String(sumQuery(req.query)));
     });
 
-    // An awaited timer suspends the request and frees the thread, so the
-    // waits in flight are bounded by memory. The delay is read from the path
+    // The reply is sent from a timer callback, so the request is a pending
+    // timer and nothing else while it waits: the handler returns at once and
+    // the response object answers when the timer fires, the same way an
+    // Express handler would. An async handler awaiting the timer did the same
+    // work through three promise hops per request (the handler's own, the
+    // router's, the server's), which at two million requests a second was a
+    // measurable share of the worker's time. The delay is read from the path
     // on every request.
-    app.get('/delay/:ms').handler(async (req, res) => {
+    app.get('/delay/:ms').handler((req, res) => {
         const ms = Number.parseInt(req.params.ms, 10);
         if (!Number.isInteger(ms) || ms < 0) {
             res.status(404).send('Not found');
             return;
         }
-        if (ms > 0) await new Promise(resolve => setTimeout(resolve, ms));
-        res.send(String(ms));
+        if (ms === 0) {
+            res.send('0');
+            return;
+        }
+        setTimeout(() => res.send(String(ms)), ms);
     });
 
     // json-comp: the framework's compression middleware on this route alone,
     // so no other endpoint pays for the encoder. It negotiates off
     // Accept-Encoding per request and sends the body as is when none is sent.
-    // gzip at level 3 is preferred over brotli: the profile prices bytes
-    // squared against rate, and on these bodies level 3 costs a little over
-    // a third of the CPU of the default level 6 for 9% more bytes, and about
-    // half the CPU of brotli at quality 3 for 10% more - the rate wins. The
-    // middleware keeps one gzip encoder per worker and resets it between
-    // bodies, so no response pays for building one. brotli, at the quality
-    // fulmine and spliffy use, stays available for a client that accepts
-    // nothing else. The TLS listener (json-tls) is never asked for an
-    // encoding, so its route carries no middleware and stays on the router's
-    // fast path.
+    // brotli at quality 3 is preferred, with the encoder's window fitted to
+    // the body by the framework: the profile prices bytes squared against
+    // rate, and measured on the board gzip at level 3 ran 7% more requests
+    // than brotli 3 but sent 10% more bytes per reply, which the square turns
+    // into a 9% lower score. gzip at level 3 stays available for a client
+    // that accepts nothing else; the middleware keeps one gzip encoder per
+    // worker and resets it between bodies (brotli's encoder forgets its
+    // quality on reset, so it is built per body). The TLS listener (json-tls)
+    // is never asked for an encoding, so its route carries no middleware and
+    // stays on the router's fast path.
     const json = (req, res) => {
         res.json(jsonItems(req));
     };
@@ -228,9 +236,9 @@ function defineRoutes(app) {
         app.get('/json/:count')
             .before(
                 middleware.compression({
-                    encodings: ['gzip', 'br'],
-                    gzip: { level: 3 },
+                    encodings: ['br', 'gzip'],
                     brotli: { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 3 } },
+                    gzip: { level: 3 },
                 })
             )
             .handler(json);
