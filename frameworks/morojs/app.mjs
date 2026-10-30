@@ -430,6 +430,15 @@ const app = await createApp({
         engine: 'moro',
         requestTracking: { enabled: false },
         requestLogging: { enabled: false },
+        // The listen backlog. The edges in front of the gateway and
+        // production-stack profiles keep an idle pool of 2048 upstream
+        // connections under tens of thousands of requests in flight, so they
+        // dial and drop thousands of connections per wave; at the engine's
+        // default of 512 a wave overflows a worker's accept queue, the
+        // kernel drops the SYN and the proxy retries it a second later. That
+        // second was the profile's tail (p99 of 0.8 s on gateway-h3, 3.8 s on
+        // production-stack). The harness raises somaxconn to 65535 for this.
+        backlog: 16384,
         ...server,
     },
     performance: { clustering: { enabled: true, workers } },

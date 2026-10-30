@@ -47,6 +47,12 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   gzip at level 3 remains available to a client that accepts nothing else; the middleware keeps one
   gzip encoder per worker and resets it between bodies (`reuseEncoders`, the default), while the
   brotli encoder is built per body, since it forgets its quality on reset.
+- `server.backlog: 16384`: the edges in front of the gateway and production-stack profiles keep an
+  idle pool of 2048 upstream connections under tens of thousands of requests in flight, so they
+  dial and drop thousands of connections per wave. At the engine's default backlog of 512 a wave
+  overflows a worker's accept queue, the kernel drops the SYN and the proxy retries it a second
+  later, which was those profiles' tail latency. Measured on a 4096-dialer churn: p99 1019 ms at
+  512, 52 ms at 4096, same throughput. The harness raises `somaxconn` to 65535 for this.
 - `UV_THREADPOOL_SIZE=64` is set in the Dockerfile. The libuv pool serves the compression and
   file reads of every worker thread in the process; Moro sets 64 itself but only at `listen()`,
   after its startup has initialised the pool at Node's default of 4, and Node reads the variable
