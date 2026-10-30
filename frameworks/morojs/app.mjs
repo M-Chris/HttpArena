@@ -98,16 +98,24 @@ if (isWorker) {
 
 // Postgres for /async-db, /fortunes and the production-stack api, all served
 // on :8080. The pool is sized from DATABASE_MAX_CONN across the workers, so
-// the cluster as a whole stays inside what Postgres allows.
+// the cluster as a whole stays inside what Postgres allows; 240 at most
+// leaves the server's own reserve (DATABASE_MAX_CONN is its max_connections,
+// and a cluster sitting exactly on it is refused its last connections).
 let pool = null;
 if (isWorker && ROLE === 'plain' && process.env.DATABASE_URL) {
-    const maxConn = parseInt(process.env.DATABASE_MAX_CONN, 10) || 256;
+    const maxConn = Math.min(parseInt(process.env.DATABASE_MAX_CONN, 10) || 256, 240);
     pool = new pg.Pool({
         connectionString: process.env.DATABASE_URL,
         max: Math.max(1, Math.floor(maxConn / workers)),
     });
     pool.on('error', () => {});
 }
+
+// The fortunes template, compiled once per worker: EJS escapes every
+// interpolated value, so the row carrying a <script> tag renders as text.
+const renderFortunes = isWorker
+    ? ejs.compile(readFileSync(FORTUNES_VIEW, 'utf8'), { filename: FORTUNES_VIEW })
+    : null;
 
 // The production-stack cache-aside goes through the framework's own cache
 // adapters: Redis when the stack provides one, shared across the cluster so
@@ -254,7 +262,12 @@ function defineRoutes(app) {
         res.send(req.rawBody ?? Buffer.alloc(0));
     });
 
-    app.get('/async-db').handler(async (req, res) => {
+    // The driver hands the rows to its callback and the callback answers:
+    // the request is one prepared-statement round trip and nothing else. An
+    // async handler awaiting the same query added three promise hops per
+    // request (the handler's, the router's, the server's), which is what
+    // the delay route gave up for a fifth more throughput.
+    app.get('/async-db').handler((req, res) => {
         if (!pool) {
             res.json(EMPTY);
             return;
@@ -264,34 +277,45 @@ function defineRoutes(app) {
         let limit = parseInt(req.query.limit, 10) || 50;
         if (limit < 1) limit = 1;
         if (limit > 50) limit = 50;
-        try {
-            const { rows } = await pool.query({ name: 'async-db', text: ASYNC_DB_SQL, values: [min, max, limit] });
+        pool.query({ name: 'async-db', text: ASYNC_DB_SQL, values: [min, max, limit] }, (err, result) => {
+            if (err) {
+                res.json(EMPTY);
+                return;
+            }
+            const rows = result.rows;
             res.json({ items: rows.map(itemShape), count: rows.length });
-        } catch {
-            res.json(EMPTY);
-        }
+        });
     });
 
     // fortunes: Moro has no view layer of its own, so the page goes through
-    // EJS directly, a real template engine rendering a separate template file
-    // per request, with <%= %> escaping the row that carries a <script> tag.
-    app.get('/fortunes').handler(async (req, res) => {
+    // EJS directly, a real template engine with the template file compiled
+    // once per worker and rendered per request, <%= %> escaping the row that
+    // carries a <script> tag. Same callback shape as /async-db.
+    app.get('/fortunes').handler((req, res) => {
         if (!pool) {
             res.status(500).send('DB not available');
             return;
         }
-        try {
-            const { rows } = await pool.query({ name: 'fortunes', text: 'SELECT id, message FROM fortune' });
+        pool.query({ name: 'fortunes', text: 'SELECT id, message FROM fortune' }, (err, result) => {
+            if (err) {
+                res.status(500).send('query failed');
+                return;
+            }
+            const rows = result.rows;
             rows.push({ id: 0, message: RUNTIME_FORTUNE });
             // Ordinal, not locale aware: the seed carries em-dashes and collation
             // rules would order them in a way the profile does not ask for.
             rows.sort((a, b) => (a.message < b.message ? -1 : a.message > b.message ? 1 : 0));
-            const html = await ejs.renderFile(FORTUNES_VIEW, { fortunes: rows }, { cache: true });
+            let html;
+            try {
+                html = renderFortunes({ fortunes: rows });
+            } catch {
+                res.status(500).send('render failed');
+                return;
+            }
             res.setHeader('Content-Type', 'text/html; charset=utf-8');
             res.send(html);
-        } catch {
-            res.status(500).send('query failed');
-        }
+        });
     });
 
     // production-stack: the edge serves /static/* itself and sends /api/* past

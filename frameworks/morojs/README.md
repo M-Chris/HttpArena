@@ -20,8 +20,8 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
 | `/json/:count` | GET | Serializes a slice of the dataset, brotli (quality 3) or gzip (level 3) when the client asks for it |
 | `/echo` | POST | Returns the request body back verbatim (TLS listener) |
 | `/ws` | WebSocket | Echoes every text and binary frame unchanged |
-| `/async-db` | GET | Reads from PostgreSQL through `pg`, prepared statement, pool sized under `DATABASE_MAX_CONN` |
-| `/fortunes` | GET | Reads 200 rows from PostgreSQL, appends the runtime row, sorts and renders `views/fortunes.ejs` |
+| `/async-db` | GET | Reads from PostgreSQL through `pg`, prepared statement, pool sized under `DATABASE_MAX_CONN` (240 at most), the driver's callback answering the request |
+| `/fortunes` | GET | Reads the fortune rows from PostgreSQL, appends the runtime row, sorts and renders `views/fortunes.ejs`, compiled once per worker |
 | `/static/:filename` | GET | Serves a file from disk through the framework's `staticFiles` middleware (TLS listener) |
 | `/public/baseline`, `/public/json/:count` | GET | The baseline and JSON routes as the production-stack edge forwards them, no auth |
 | `/api/items/:id` | GET/POST | Cache-aside read with `X-Cache: HIT` or `MISS`, or a JSON-body update that invalidates the entry and answers 204 |
@@ -89,8 +89,12 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   mounted on the TLS listener behind a path check so the JSON route on that port does not pay for
   the lookup; the check calls `next()` synchronously, which keeps that route on the server's
   synchronous dispatch.
-- `fortunes` goes through EJS directly: Moro ships no view layer, so the template is rendered by
-  the engine's own `renderFile`, a separate file with `<%= %>` escaping every cell.
+- `fortunes` goes through EJS directly: Moro ships no view layer, so the template file is compiled
+  once per worker with `ejs.compile` and rendered per request, `<%= %>` escaping every cell.
+- `/async-db` and `/fortunes` answer from the driver's callback rather than from an async handler:
+  the reply is the same, and the request stops paying three promise hops (the handler's, the
+  router's, the server's). `pg-native`, which the uWebSockets-based entries use, loads its libpq
+  addon once per process and refuses the second worker thread, so it cannot serve a thread cluster.
 - The gateway and production-stack edges are stock nginx and Caddy, configured as the fulmine
   entry configures them: `/static/*` off disk at the edge, everything else forwarded over
   loopback h1 with a keepalive pool, and `/api/*` past the shared JWT verifier first.
