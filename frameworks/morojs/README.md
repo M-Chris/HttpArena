@@ -6,7 +6,7 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
 
 - **Language:** JavaScript
 - **Runtime:** Node.js 26
-- **Framework:** [MoroJS 1.8](https://github.com/Moro-JS/moro) on `@morojs/engine` 1.1.15, its own native HTTP engine
+- **Framework:** [MoroJS 1.8](https://github.com/Moro-JS/moro) on `@morojs/engine` 1.1.16, its own native HTTP engine
 - **Build:** Multi-stage on `node:26-trixie-slim`; the engine ships prebuilt binaries, so no toolchain
 
 ## Endpoints
@@ -44,9 +44,17 @@ MoroJS on its native HTTP engine, clustered by the framework itself.
   middleware's `encodings` and `brotli` options, with the encoder's window fitted to the body by
   the framework: the profile scores bytes squared against rate, and measured on the board gzip at
   level 3 ran 7% more requests than brotli 3 but sent 10% more bytes per reply, a 9% lower score.
-  gzip at level 3 remains available to a client that accepts nothing else; the middleware keeps one
-  gzip encoder per worker and resets it between bodies (`reuseEncoders`, the default), while the
-  brotli encoder is built per body, since it forgets its quality on reset.
+  gzip at level 3 remains available to a client that accepts nothing else. The middleware keeps one
+  encoder per setting per worker and resets it between bodies (`reuseEncoders`, the default): on the
+  Node 26 the image ships, brotli's reset keeps its quality, so a reply costs the compression alone
+  and not an encoder built and torn down around it (measured on these bodies: 30 us against 45 or
+  more per body).
+- The proxied stacks (`compose.gateway.yml`, `compose.gateway-h3.yml`, `compose.production-stack.yml`)
+  run the server with `MORO_ENGINE_SERVE_ORDER=auto`: the engine's epoll transport serves a loop
+  turn's sockets grouped by the CPU their peer sends from, an order its design notes measured to lose
+  about a quarter at 256 connections against arrival order when every request enters JavaScript under
+  a peer that oversubscribes its cores, which is what an edge proxy is. `auto` has each loop measure
+  both orders and keep the faster one. The standalone container keeps the engine's default.
 - `server.backlog: 16384`: the edges in front of the gateway and production-stack profiles keep an
   idle pool of 2048 upstream connections under tens of thousands of requests in flight, so they
   dial and drop thousands of connections per wave. At the engine's default backlog of 512 a wave
